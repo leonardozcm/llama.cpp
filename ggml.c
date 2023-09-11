@@ -4303,6 +4303,22 @@ int64_t ggml_nrows(const struct ggml_tensor * tensor) {
 }
 
 size_t ggml_nbytes(const struct ggml_tensor * tensor) {
+    // int length = sizeof(tensor->nb) / sizeof(tensor->nb[0]); // 计算数组长度
+
+    // printf("NB elements: [");
+    // for (int i = 0; i < length; i++) {
+    //     printf("%zu, ", tensor->nb[i]);
+    // }
+    // printf("]\n");
+
+    // length = sizeof(tensor->ne) / sizeof(tensor->ne[0]); // 计算数组长度
+
+    // printf("NE elements: [");
+    // for (int i = 0; i < length; i++) {
+    //     printf("%lld ", tensor->ne[i]);
+    // }
+    // printf("]\n");
+
     size_t nbytes = tensor->ne[0]*tensor->nb[0]/ggml_blck_size(tensor->type);
     for (int i = 1; i < GGML_MAX_DIMS; ++i) {
         nbytes += (tensor->ne[i] - 1)*tensor->nb[i];

@@ -521,7 +521,7 @@ static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * r
         }
         // 算出scale factor，将每个block归一化到int4的范围内
         const float d  = max / -8; // INT4 [-2^3, 2^3-1] 为什么要是负的?
-        const float id = d ? 1.0f/d : 0.0f; // 如果d是0，不可被除
+        const float id = d ? 1.0f/d : 0.0f; // 如果d是0，不可被除。id= -8.0f / max
 
         y[i].d = GGML_FP32_TO_FP16(d);// #define GGML_FP32_TO_FP16(x) (x)
                                     // 损失后13位实部和后三位指数部
@@ -533,12 +533,12 @@ static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * r
             const float x0 = x[i*qk + 0    + j]*id;// belongs to (float)[-2^3, 2^3-1]
             const float x1 = x[i*qk + qk/2 + j]*id;
 
-
-            // 这一步没看懂
-            const uint8_t xi0 = MIN(15, (int8_t)(x0 + 8.5f));// (float)[0.5f, 15.5f] -> int8_t ->
+            const uint8_t xi0 = MIN(15, (int8_t)(x0 + 8.5f));// (float)[0.5f, 15.5f] -> int8_t [0, 15], 截断任何小数部分
             const uint8_t xi1 = MIN(15, (int8_t)(x1 + 8.5f));
-            // 8.5f: 0 10000010 00010000000000000000000
+            // 8.5: -8~ -7.5 -> 0, -7.5~ -6.5 -> 1 ... 6.5~7 -> 15
+            // 8: -8~ -7 -> 0, -7~ -6 -> 1 ... 6~7 -> 14 动态范围小了
 
+            // [00000000, 00001111]
             // 用一个int8的前后4位来同时储存两个int4
             y[i].qs[j]  = xi0;
             y[i].qs[j] |= xi1 << 4;
@@ -547,6 +547,128 @@ static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * r
 }
 ```
 关于量化的介绍->https://zhuanlan.zhihu.com/p/645362500
+TODO:求一下截断造成的最大的误差
+delta(x_qs) <= 0.5, delta(x_01)= delta(x_qs)/ | id | = 0.5 * max / 8.0 = 0.0625max
+最大误差大概在6.25%
+
+顺便看一下dequantize的实现：
+```cpp
+static void dequantize_row_q4_0(const block_q4_0 * restrict x, float * restrict y, int k) {
+    static const int qk = QK4_0; // 32
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d); // ((float) (x))
+
+        for (int j = 0; j < qk/2; ++j) {
+            const int x0 = (x[i].qs[j] & 0x0F) - 8; // 0x0F: 00001111，取后4位再减8，相当于上面的逆向操作
+            const int x1 = (x[i].qs[j] >>   4) - 8;// 取前四位
+
+            y[i*qk + j + 0   ] = x0*d;// restore
+            y[i*qk + j + qk/2] = x1*d;
+        }
+    }
+}
+
+```
+再回到`llama_convert_tensor_internal`。单线程的话在这里就直接转回fp32。
+```cpp
+    if (nthread < 2) {
+        if (tensor->type == GGML_TYPE_F16) {
+            ggml_fp16_to_fp32_row((ggml_fp16_t *)tensor->data, f32_output, nelements);
+        } else if (ggml_is_quantized(tensor->type)) {
+            qtype.to_float(tensor->data, f32_output, nelements);
+        } else {
+            GGML_ASSERT(false); // unreachable
+        }
+        return;
+    }
+```
+看一下多线程的实现，这里做的还是dequantize
+```cpp
+    GGML_ASSERT(nelements % block_size == 0);
+    auto nblocks = nelements / block_size; // 一个Q4_0的block可以含有32个elements，这里算总共有多少blocks
+    auto blocks_per_thread = nblocks / nthread; // 每个线程分配的blocks
+    auto spare_blocks = nblocks - (blocks_per_thread * nthread); // if blocks aren't divisible by thread count，余数
+
+    std::vector<std::thread> workers;
+    for (auto tnum = 0, in_buff_offs = 0, out_buff_offs = 0; tnum < nthread; tnum++) {
+        auto thr_blocks = blocks_per_thread + (tnum == nthread - 1 ? spare_blocks : 0); // num blocks for this thread
+        auto thr_elems = thr_blocks * block_size; // number of elements for this thread
+        auto thr_block_bytes = thr_blocks * block_size_bytes; // number of input bytes for this thread
+
+        auto compute = [qtype] (ggml_type typ, uint8_t * inbuf, float * outbuf, int nels) {
+            if (typ == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((ggml_fp16_t *)inbuf, outbuf, nels);
+            } else {
+                qtype.to_float(inbuf, outbuf, nels);
+            }
+        };// 定义线程的任务原型，分块读入写出
+        workers.push_back(std::thread(compute, tensor->type, (uint8_t *) tensor->data + in_buff_offs, f32_output + out_buff_offs, thr_elems));
+        in_buff_offs += thr_block_bytes;
+        out_buff_offs += thr_elems;
+    }
+    for (auto & worker : workers) {
+        worker.join();// 等待任务完成
+    }
+```
+回到主函数`llama_model_quantize_internal`
+```cpp
+            work.resize(nelements * 4); // upper bound on size, 上限是全是4bytes的float
+            new_data = work.data();
+            std::vector<int64_t> hist_cur(1 << 4, 0);
+
+            static const int chunk_size = 32 * 512; //怎么得出来的？还是人为规定的？
+            const int nchunk = (nelements + chunk_size - 1)/chunk_size;
+            const int nthread_use = nthread > 1 ? std::max(1, std::min(nthread, nchunk)) : 1;
+```
+看一下多线程quant的逻辑。
+```cpp
+                size_t counter = 0;
+                new_size = 0;
+                auto compute = [&mutex, &counter, &hist_cur, &new_size, new_type, f32_data, new_data, nelements]() {
+                    std::vector<int64_t> local_hist;
+                    size_t local_size = 0;
+                    while (true) {
+                        std::unique_lock<std::mutex> lock(mutex);
+                        size_t first = counter; counter += chunk_size;
+                        if (first >= nelements) {
+                            if (!local_hist.empty()) {
+                                for (int j=0; j<int(local_hist.size()); ++j) {
+                                    hist_cur[j] += local_hist[j];
+                                }
+                                new_size += local_size;
+                            }
+                            break;
+                        }
+                        lock.unlock();
+                        size_t last = std::min(nelements, first + chunk_size);
+                        if (local_hist.empty()) {
+                            local_hist.resize(hist_cur.size(), 0);
+                        }
+                        local_size += ggml_quantize_chunk(new_type, f32_data, new_data, first, last - first, local_hist.data());
+                    }
+                };
+                if ((int) workers.size() < nthread_use - 1) {
+                    workers.resize(nthread_use - 1);
+                }
+                for (int it = 0; it < nthread_use - 1; ++it) {
+                    workers[it] = std::thread(compute);
+                }
+                compute();//剩下的在主线程处理，有点炫技。
+                for (int it = 0; it < nthread_use - 1; ++it) {
+                    workers[it].join();
+                }
+```
+这里没有显式地分配每一个thread具体take的范围，而是去让他们自己去抢占。这是因为`const int nthread_use = nthread > 1 ? std::max(1, std::min(nthread, nchunk)) : 1;`这一步导致我们没法确定nchunk是否大于nthread，
+如果大于的话，那么我们去schedule这些thread就会变成一个非常头疼的问题，与其头疼，不如直接将问题丢给worker自己去调度，每个线程每次只处理chunk_size大小的elements，每次处理都会有记录，处理完了再从共享的变量counter中读取下次处理的起始点。
+
+至此quant的主要逻辑就结束了，剩下的就是一些更新tensor的meta data的记录信息，写入.bin文件的工作。当所有的tensor都这样写过一遍后，再回到文件头去更新model的meta data，最后打印sumary。
+
+
 
 # Some hints
  - (void) x, 要有这个空操作的原因是，GGML_PRINT_DEBUG这个宏在release的时候会关掉，届时编译器会放出warning。
